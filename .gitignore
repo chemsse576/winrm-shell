@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Build artifacts
+*.obj
+
+# Sensitive
+*.key
+*.pfx
+*.txt
+
+# Misc
+Thumbs.db
+.DS_Store
